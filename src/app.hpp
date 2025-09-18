@@ -7,7 +7,7 @@
 class App {
 public:
     int run(int argc, char** argv);
-
+    int run_with_config(Config cfg);
 private:
     void try_connect();
 

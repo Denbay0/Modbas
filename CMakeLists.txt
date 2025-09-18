@@ -19,6 +19,7 @@ add_executable(light_scheduler
   src/loader.cpp
   src/modbus_tcp.cpp
   src/scheduler.cpp
+  src/interactive.cpp 
 )
 
 # Заголовки лежат в src/

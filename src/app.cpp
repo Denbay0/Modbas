@@ -1,6 +1,7 @@
 #include "app.hpp"
 #include "loader.hpp"
 #include "time_util.hpp"
+#include "scheduler.hpp"
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -24,27 +25,31 @@ void App::try_connect() {
     }
 }
 
+int App::run_with_config(Config cfg) {
+    cfg_ = std::move(cfg);
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
+
+    SchedulerEngine eng(cfg_, mb_, [this](){ this->try_connect(); });
+    engine_ = &eng;
+
+    try_connect();
+    engine_->resume_after_restart();
+
+    while(!g_stop) {
+        engine_->step();
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    std::cout<<"Stopping...\n";
+    return 0;
+}
+
 int App::run(int argc, char** argv) {
     try {
         std::string cfg_path = (argc>1)? argv[1] : "config/config.ini";
-        cfg_ = load_config_ini(cfg_path);
-
-        std::signal(SIGINT, on_signal);
-        std::signal(SIGTERM, on_signal);
-
-        // Engine получает лямбду на реконнект
-        SchedulerEngine eng(cfg_, mb_, [this](){ this->try_connect(); });
-        engine_ = &eng;
-
-        try_connect();
-        engine_->resume_after_restart();
-
-        while(!g_stop) {
-            engine_->step();
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-        std::cout<<"Stopping...\n";
-        return 0;
+        // обычный режим (ini)
+        Config loaded = load_config_ini(cfg_path);
+        return run_with_config(std::move(loaded));
     } catch (const std::exception& e) {
         std::cerr<<"Fatal: "<<e.what()<<"\n";
         return 1;
