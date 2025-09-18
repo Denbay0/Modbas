@@ -18,6 +18,7 @@
 // Holding Registers:
 //   0                 : heartbeat counter (increments each second)
 //   1                 : number of schedule slots (read-only)
+//   2                 : control (bit0=1 -> graceful shutdown)
 //   100 + i*10 + 0    : enabled (0/1)
 //   100 + i*10 + 1    : type (0=weekly,1=once)
 //   100 + i*10 + 2    : area_coil (coil offset to toggle)
@@ -64,6 +65,7 @@ static const uint16_t COIL_REMOTE_EN_BASE = 500;
 
 static const uint16_t HR_HEARTBEAT        = 0;
 static const uint16_t HR_NUM_SLOTS        = 1;
+static const uint16_t HR_CONTROL          = 2;   // bit0=shutdown request
 static const uint16_t HR_SCHED_BASE       = 100;
 static const uint16_t HR_SCHED_STRIDE     = 10;
 
@@ -86,6 +88,7 @@ static uint16_t g_holds[MAX_HOLDS];
 static std::mutex g_mx;
 
 static std::atomic_bool g_stop{false};
+static SOCKET g_listen = INVALID_SOCKET; // чтобы по желанию можно было закрыть слушающий сокет
 
 // ---- Winsock helpers
 static void die(const char* msg){ std::cerr<<"Fatal: "<<msg<<"\n"; std::exit(1); }
@@ -97,16 +100,26 @@ static SOCKET listen_on(uint16_t port){
     SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s==INVALID_SOCKET) die("socket failed");
     int yes=1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+    // небольшой таймаут на accept/select управляем через select()
     sockaddr_in a{}; a.sin_family=AF_INET; a.sin_port=htons(port); a.sin_addr.s_addr=htonl(INADDR_ANY);
     if (bind(s,(sockaddr*)&a,sizeof(a))==SOCKET_ERROR) die("bind failed");
-    if (listen(s, 1)==SOCKET_ERROR) die("listen failed");
+    if (listen(s, SOMAXCONN)==SOCKET_ERROR) die("listen failed");
     return s;
 }
 static int recv_all(SOCKET c, char* buf, int len){
     int total=0;
-    while(total<len){
+    while(total<len && !g_stop){
         int r = ::recv(c, buf+total, len-total, 0);
-        if (r<=0) return r;
+        if (r == SOCKET_ERROR) {
+            int e = WSAGetLastError();
+            if (e==WSAETIMEDOUT || e==WSAEWOULDBLOCK) {
+                // таймаут — проверим флаг и попробуем ещё раз
+                if (g_stop) return -1;
+                continue;
+            }
+            return -1;
+        }
+        if (r == 0) return 0; // closed
         total += r;
     }
     return total;
@@ -135,6 +148,11 @@ static BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
     if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_CLOSE_EVENT ||
         ctrlType == CTRL_BREAK_EVENT || ctrlType == CTRL_SHUTDOWN_EVENT) {
         g_stop = true;
+        // Прерывать блокирующий accept() не обязательно — основной цикл использует select() с таймаутом
+        if (g_listen != INVALID_SOCKET) {
+            // можно попытаться разбудить select(), закрыв слушающий сокет
+            // closesocket(g_listen); // НЕ обязательно; select проснётся сам по таймауту
+        }
         return TRUE;
     }
     return FALSE;
@@ -143,7 +161,6 @@ static BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
 
 // ---- Scheduler core (runs inside emulator)
 static void scheduler_loop(){
-    // Initialize constant fields
     {
         std::lock_guard<std::mutex> lk(g_mx);
         g_holds[HR_NUM_SLOTS] = static_cast<uint16_t>(MAX_SLOTS);
@@ -159,6 +176,11 @@ static void scheduler_loop(){
 
             // heartbeat
             g_holds[HR_HEARTBEAT] = hb++;
+
+            // shutdown по HR_CONTROL.bit0
+            if (g_holds[HR_CONTROL] & 0x0001) {
+                g_stop = true;
+            }
 
             for (int i=0;i<MAX_SLOTS;i++){
                 uint16_t base = static_cast<uint16_t>(HR_SCHED_BASE + i*HR_SCHED_STRIDE);
@@ -268,129 +290,155 @@ int main(int argc, char** argv){
     std::signal(SIGTERM, [](int){ g_stop = true; });
 #endif
 
-    // expose number of slots
     {
         std::lock_guard<std::mutex> lk(g_mx);
         g_holds[HR_NUM_SLOTS] = static_cast<uint16_t>(MAX_SLOTS);
     }
 
-    // start scheduler thread
     std::thread sched(scheduler_loop);
 
     init_sock();
-    SOCKET srv = listen_on(port);
+    g_listen = listen_on(port);
     std::cout<<"PLC Scheduler emulator listening on 0.0.0.0:"<<port<<" unit="<<(int)unit<<"\n";
 
+    // Основной цикл: select() с таймаутом, чтобы Ctrl+C не «вешал» accept()
     while(!g_stop){
-        sockaddr_in ca{}; int calen=sizeof(ca);
-        SOCKET c = ::accept(srv, (sockaddr*)&ca, &calen);
-        if (c==INVALID_SOCKET){ if (g_stop) break; continue; }
-        char ipstr[64]; inet_ntop(AF_INET, &ca.sin_addr, ipstr, sizeof(ipstr));
-        std::cout<<"Client connected: "<<ipstr<<"\n";
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(g_listen, &rfds);
+        timeval tv; tv.tv_sec = 1; tv.tv_usec = 0; // 1s таймаут
+        int sel = ::select(0 /*ignored on winsock*/, &rfds, nullptr, nullptr, &tv);
+        if (g_stop) break;
+        if (sel == SOCKET_ERROR) {
+            int e = WSAGetLastError();
+            if (e == WSAEINTR) continue;
+            std::cerr<<"select error: "<<e<<"\n";
+            break;
+        }
+        if (sel == 0) continue; // таймаут — проверим g_stop и продолжим
 
-        for(;;){
-            // MBAP
-            uint8_t mbap[7];
-            int r = recv_all(c, (char*)mbap, 7);
-            if (r<=0){ std::cout<<"Client disconnected\n"; break; }
+        if (FD_ISSET(g_listen, &rfds)) {
+            sockaddr_in ca{}; int calen=sizeof(ca);
+            SOCKET c = ::accept(g_listen, (sockaddr*)&ca, &calen);
+            if (c==INVALID_SOCKET) continue;
 
-            uint16_t tx  = get_u16(mbap+0);
-            uint16_t pid = get_u16(mbap+2); (void)pid;
-            uint16_t len = get_u16(mbap+4);
-            uint8_t  uid = mbap[6];
-            if (len<1){ std::cout<<"Bad len\n"; break; }
+            // Таймауты на recv/send, чтобы Ctrl+C пробуждал цикл клиента
+            int to = 1000; // мс
+            setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+            setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
 
-            std::vector<uint8_t> pdu(len);
-            r = recv_all(c, (char*)pdu.data(), len);
-            if (r<=0){ std::cout<<"Client disconnected\n"; break; }
+            char ipstr[64]; inet_ntop(AF_INET, &ca.sin_addr, ipstr, sizeof(ipstr));
+            std::cout<<"Client connected: "<<ipstr<<"\n";
 
-            uint8_t fc = pdu[0];
+            for(;;){
+                if (g_stop) { ::closesocket(c); break; }
 
-            auto send_resp = [&](const std::vector<uint8_t>& rpdu){
-                std::vector<uint8_t> resp;
-                put_u16(resp, tx);
-                put_u16(resp, 0x0000);
-                put_u16(resp, static_cast<uint16_t>(rpdu.size()));
-                resp.push_back(uid);
-                resp.insert(resp.end(), rpdu.begin(), rpdu.end());
-                ::send(c, (const char*)resp.data(), (int)resp.size(), 0);
-            };
-            auto send_ex = [&](uint8_t base_fc, uint8_t code){
-                std::vector<uint8_t> rpdu;
-                rpdu.push_back(static_cast<uint8_t>(base_fc | 0x80));
-                rpdu.push_back(code);
-                send_resp(rpdu);
-            };
+                // MBAP
+                uint8_t mbap[7];
+                int r = recv_all(c, (char*)mbap, 7);
+                if (r<=0){ std::cout<<"Client disconnected\n"; ::closesocket(c); break; }
 
-            if (uid != unit){ send_ex(fc, 0x0B); continue; }
+                uint16_t tx  = get_u16(mbap+0);
+                uint16_t pid = get_u16(mbap+2); (void)pid;
+                uint16_t len = get_u16(mbap+4);
+                uint8_t  uid = mbap[6];
+                if (len<1){ std::cout<<"Bad len\n"; ::closesocket(c); break; }
 
-            try{
-                std::lock_guard<std::mutex> lk(g_mx);
+                std::vector<uint8_t> pdu(len);
+                r = recv_all(c, (char*)pdu.data(), len);
+                if (r<=0){ std::cout<<"Client disconnected\n"; ::closesocket(c); break; }
 
-                if (fc==0x05){ // Write Single Coil
-                    if (pdu.size()<5){ send_ex(fc,0x03); continue; }
-                    uint16_t addr = get_u16(&pdu[1]);
-                    uint16_t val  = get_u16(&pdu[3]);
-                    if (addr>=MAX_COILS){ send_ex(fc,0x02); continue; }
-                    g_coils[addr] = (val==0xFF00)?1:0;
-                    // Note: scheduler also writes area coils; SCADA typically writes remote_enable coils here.
-                    std::vector<uint8_t> rpdu{0x05};
-                    put_u16(rpdu, addr); put_u16(rpdu, (g_coils[addr]?0xFF00:0x0000));
+                uint8_t fc = pdu[0];
+
+                auto send_resp = [&](const std::vector<uint8_t>& rpdu){
+                    std::vector<uint8_t> resp;
+                    put_u16(resp, tx);
+                    put_u16(resp, 0x0000);
+                    put_u16(resp, static_cast<uint16_t>(rpdu.size()));
+                    resp.push_back(uid);
+                    resp.insert(resp.end(), rpdu.begin(), rpdu.end());
+                    ::send(c, (const char*)resp.data(), (int)resp.size(), 0);
+                };
+                auto send_ex = [&](uint8_t base_fc, uint8_t code){
+                    std::vector<uint8_t> rpdu;
+                    rpdu.push_back(static_cast<uint8_t>(base_fc | 0x80));
+                    rpdu.push_back(code);
                     send_resp(rpdu);
-                }
-                else if (fc==0x01){ // Read Coils
-                    if (pdu.size()<5){ send_ex(fc,0x03); continue; }
-                    uint16_t addr = get_u16(&pdu[1]);
-                    uint16_t cnt  = get_u16(&pdu[3]);
-                    if ((int)addr + (int)cnt > MAX_COILS){ send_ex(fc,0x02); continue; }
-                    uint8_t bc = static_cast<uint8_t>((cnt+7)/8);
-                    std::vector<uint8_t> rpdu; rpdu.reserve(2+bc);
-                    rpdu.push_back(0x01); rpdu.push_back(bc);
-                    uint8_t cur=0;
-                    for (uint16_t i=0;i<cnt;i++){
-                        uint8_t bit = g_coils[addr+i]?1:0;
-                        cur |= (bit << (i%8));
-                        if ((i%8)==7){ rpdu.push_back(cur); cur=0; }
+                };
+
+                if (uid != unit){ send_ex(fc, 0x0B); continue; }
+
+                try{
+                    std::lock_guard<std::mutex> lk(g_mx);
+
+                    if (fc==0x05){ // Write Single Coil
+                        if (pdu.size()<5){ send_ex(fc,0x03); continue; }
+                        uint16_t addr = get_u16(&pdu[1]);
+                        uint16_t val  = get_u16(&pdu[3]);
+                        if (addr>=MAX_COILS){ send_ex(fc,0x02); continue; }
+                        g_coils[addr] = (val==0xFF00)?1:0;
+                        // SCADA обычно пишет сюда remote_enable (500+i) или ручные DO
+                        std::vector<uint8_t> rpdu{0x05};
+                        put_u16(rpdu, addr); put_u16(rpdu, (g_coils[addr]?0xFF00:0x0000));
+                        send_resp(rpdu);
                     }
-                    if ((cnt%8)!=0) rpdu.push_back(cur);
-                    send_resp(rpdu);
-                }
-                else if (fc==0x06){ // Write Single Holding Register
-                    if (pdu.size()<5){ send_ex(fc,0x03); continue; }
-                    uint16_t addr = get_u16(&pdu[1]);
-                    uint16_t val  = get_u16(&pdu[3]);
-                    if (addr>=MAX_HOLDS){ send_ex(fc,0x02); continue; }
+                    else if (fc==0x01){ // Read Coils
+                        if (pdu.size()<5){ send_ex(fc,0x03); continue; }
+                        uint16_t addr = get_u16(&pdu[1]);
+                        uint16_t cnt  = get_u16(&pdu[3]);
+                        if ((int)addr + (int)cnt > MAX_COILS){ send_ex(fc,0x02); continue; }
+                        uint8_t bc = static_cast<uint8_t>((cnt+7)/8);
+                        std::vector<uint8_t> rpdu; rpdu.reserve(2+bc);
+                        rpdu.push_back(0x01); rpdu.push_back(bc);
+                        uint8_t cur=0;
+                        for (uint16_t i=0;i<cnt;i++){
+                            uint8_t bit = g_coils[addr+i]?1:0;
+                            cur |= (bit << (i%8));
+                            if ((i%8)==7){ rpdu.push_back(cur); cur=0; }
+                        }
+                        if ((cnt%8)!=0) rpdu.push_back(cur);
+                        send_resp(rpdu);
+                    }
+                    else if (fc==0x06){ // Write Single Holding Register
+                        if (pdu.size()<5){ send_ex(fc,0x03); continue; }
+                        uint16_t addr = get_u16(&pdu[1]);
+                        uint16_t val  = get_u16(&pdu[3]);
+                        if (addr>=MAX_HOLDS){ send_ex(fc,0x02); continue; }
 
-                    // protect read-only fields
-                    bool ro = (addr==HR_NUM_SLOTS);
-                    if (!ro) g_holds[addr] = val;
+                        // protect read-only fields
+                        bool ro = (addr==HR_NUM_SLOTS) || (addr>=HR_SCHED_BASE && ((addr-HR_SCHED_BASE)%HR_SCHED_STRIDE)==F_STATUS);
+                        if (!ro) g_holds[addr] = val;
 
-                    std::vector<uint8_t> rpdu{0x06};
-                    put_u16(rpdu, addr); put_u16(rpdu, g_holds[addr]);
-                    send_resp(rpdu);
+                        // handle control: bit0 -> shutdown
+                        if (addr == HR_CONTROL && (g_holds[addr] & 0x0001)) {
+                            g_stop = true;
+                        }
+
+                        std::vector<uint8_t> rpdu{0x06};
+                        put_u16(rpdu, addr); put_u16(rpdu, g_holds[addr]);
+                        send_resp(rpdu);
+                    }
+                    else if (fc==0x03){ // Read Holding Registers
+                        if (pdu.size()<5){ send_ex(fc,0x03); continue; }
+                        uint16_t addr = get_u16(&pdu[1]);
+                        uint16_t cnt  = get_u16(&pdu[3]);
+                        if ((int)addr + (int)cnt > MAX_HOLDS){ send_ex(fc,0x02); continue; }
+                        std::vector<uint8_t> rpdu; rpdu.reserve(2+cnt*2);
+                        rpdu.push_back(0x03); rpdu.push_back(static_cast<uint8_t>(cnt*2));
+                        for (uint16_t i=0;i<cnt;i++) put_u16(rpdu, g_holds[addr+i]);
+                        send_resp(rpdu);
+                    }
+                    else {
+                        send_ex(fc, 0x01); // Illegal Function
+                    }
+                } catch(...){
+                    send_ex(fc, 0x04); // Slave Device Failure
                 }
-                else if (fc==0x03){ // Read Holding Registers
-                    if (pdu.size()<5){ send_ex(fc,0x03); continue; }
-                    uint16_t addr = get_u16(&pdu[1]);
-                    uint16_t cnt  = get_u16(&pdu[3]);
-                    if ((int)addr + (int)cnt > MAX_HOLDS){ send_ex(fc,0x02); continue; }
-                    std::vector<uint8_t> rpdu; rpdu.reserve(2+cnt*2);
-                    rpdu.push_back(0x03); rpdu.push_back(static_cast<uint8_t>(cnt*2));
-                    for (uint16_t i=0;i<cnt;i++) put_u16(rpdu, g_holds[addr+i]);
-                    send_resp(rpdu);
-                }
-                else {
-                    send_ex(fc, 0x01); // Illegal Function
-                }
-            } catch(...){
-                send_ex(fc, 0x04); // Slave Device Failure
             }
         }
-
-        ::closesocket(c);
     }
 
-    closesocket(srv);
+    if (g_listen != INVALID_SOCKET) closesocket(g_listen);
     g_stop = true;
     if (sched.joinable()) sched.join();
     WSACleanup();
